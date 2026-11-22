@@ -311,3 +311,234 @@ git push origin main
 ```
 
 > **Note on running an MCP Server over `stdio`:** Never use `print()` for debugging inside `server.py`, because `stdout` is reserved for MCP JSON-RPC protocol messages. If you need debug logs, use Python's `logging` module configured to write to `sys.stderr` (we will complete this in the Day 3 task).
+
+---
+
+## C. Harden the MCP Server with Pydantic & `stderr` Logging and Connect to Cursor / Claude Desktop (Day 3: Nov 25, 2026)
+
+To complete the Day 3 task, upgrade `mcp_server/server.py` toward production standards (block invalid inputs with Pydantic, catch database errors, and write clean logs to `stderr`), then connect it directly to Cursor or Claude Desktop to test with a real LLM.
+
+### 1. Upgrade `mcp_server/server.py` with Pydantic Validation and `stderr` Logging (~20 minutes)
+
+`fastmcp` already includes `pydantic`. Update `mcp_server/server.py` to:
+
+- Route all log output to `sys.stderr` (so it never corrupts the JSON-RPC stream on `stdout`).
+- Use Pydantic's `Literal`, `Field`, and validators to enforce valid formats for `order_code`, `status`, `priority`, and `limit`.
+- Wrap database calls in `try/except (sqlite3.Error, FileNotFoundError)` and measure execution time (in milliseconds) for each tool call.
+
+```python
+import logging
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any, Literal
+from fastmcp import FastMCP
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# 1. Configure logging to stderr (never write debug output to stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("backend-support-mcp")
+
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+mcp = FastMCP("BackendSupportMCP")
+
+
+# 2. Input validation schemas using Pydantic
+class OrderLookupInput(BaseModel):
+    order_code: str = Field(..., min_length=4, max_length=20, description="Order code in ORD-1001 format")
+
+    @field_validator("order_code")
+    @classmethod
+    def normalize_code(cls, v: str) -> str:
+        code = v.strip().upper()
+        if not code.startswith("ORD-"):
+            raise ValueError("Order code must start with 'ORD-' (e.g., ORD-1001).")
+        return code
+
+
+class TicketFilterInput(BaseModel):
+    status: Literal["open", "in_progress", "resolved"] | None = None
+    priority: Literal["low", "medium", "high"] | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+def get_connection() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Database file not found at {DB_PATH}")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@mcp.resource("db://schema")
+def get_database_schema() -> str:
+    """Return the schema of all existing tables in the database."""
+    logger.info("Resource requested: db://schema")
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    return "\n\n".join(f"-- Table: {row['name']}\n{row['sql']}" for row in rows)
+
+
+@mcp.tool()
+def get_order_by_code(order_code: str) -> dict[str, Any]:
+    """Look up order details by order_code (e.g., ORD-1001), including customer information."""
+    start = time.perf_counter()
+    try:
+        validated = OrderLookupInput(order_code=order_code)
+        logger.info("Tool call: get_order_by_code(order_code=%s)", validated.order_code)
+
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT o.order_code, o.product_name, o.total_amount, o.status, o.updated_at,
+                       c.full_name AS customer_name, c.email AS customer_email, c.tier AS customer_tier
+                FROM orders o
+                JOIN customers c ON o.customer_id = c.id
+                WHERE o.order_code = ?
+                """,
+                (validated.order_code,),
+            ).fetchone()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if not row:
+            logger.info("Order %s not found (%.1fms)", validated.order_code, elapsed_ms)
+            return {"found": False, "message": f"Order '{validated.order_code}' was not found."}
+
+        logger.info("Order %s fetched successfully (%.1fms)", validated.order_code, elapsed_ms)
+        return {"found": True, "order": dict(row)}
+
+    except ValidationError as e:
+        logger.warning("Validation error in get_order_by_code: %s", e)
+        return {"found": False, "error": "invalid_input", "details": e.errors()[0]["msg"]}
+    except (sqlite3.Error, FileNotFoundError) as e:
+        logger.exception("Database error in get_order_by_code")
+        return {"found": False, "error": "database_error", "details": str(e)}
+
+
+@mcp.tool()
+def list_support_tickets(
+    status: Literal["open", "in_progress", "resolved"] | None = None,
+    priority: Literal["low", "medium", "high"] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Filter support tickets by status, priority, and maximum record limit."""
+    start = time.perf_counter()
+    try:
+        validated = TicketFilterInput(status=status, priority=priority, limit=limit)
+        logger.info(
+            "Tool call: list_support_tickets(status=%s, priority=%s, limit=%d)",
+            validated.status,
+            validated.priority,
+            validated.limit,
+        )
+
+        query = """
+            SELECT t.id, t.subject, t.priority, t.status, t.created_at,
+                   c.full_name AS customer_name, c.tier AS customer_tier,
+                   o.order_code
+            FROM support_tickets t
+            JOIN customers c ON t.customer_id = c.id
+            LEFT JOIN orders o ON t.order_id = o.id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+
+        if validated.status:
+            query += " AND t.status = ?"
+            params.append(validated.status)
+        if validated.priority:
+            query += " AND t.priority = ?"
+            params.append(validated.priority)
+
+        query += " ORDER BY t.created_at DESC LIMIT ?"
+        params.append(validated.limit)
+
+        with get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info("Fetched %d tickets (%.1fms)", len(rows), elapsed_ms)
+        return {"count": len(rows), "tickets": [dict(row) for row in rows]}
+
+    except ValidationError as e:
+        logger.warning("Validation error in list_support_tickets: %s", e)
+        return {"count": 0, "error": "invalid_input", "details": e.errors()[0]["msg"]}
+    except (sqlite3.Error, FileNotFoundError) as e:
+        logger.exception("Database error in list_support_tickets")
+        return {"count": 0, "error": "database_error", "details": str(e)}
+
+
+if __name__ == "__main__":
+    logger.info("Starting BackendSupportMCP server (DB=%s)", DB_PATH)
+    mcp.run()
+```
+
+### 2. Connect the MCP Server to Cursor (Recommended, ~5 minutes)
+
+Following the [Cursor MCP documentation](https://cursor.com/docs/mcp), create `.cursor/mcp.json` at the project root so you can use `${workspaceFolder}` instead of hardcoding machine-specific paths:
+
+**Windows:**
+
+```json
+{
+  "mcpServers": {
+    "backend-support": {
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["${workspaceFolder}/mcp_server/server.py"]
+    }
+  }
+}
+```
+
+**macOS / Linux:** change `command` to `"${workspaceFolder}/.venv/bin/python"`.
+
+Next, press `Ctrl+Shift+P` → **Reload Window**, then open **Settings → Tools & MCP** to verify that `backend-support` shows a green status dot and lists both tools.
+
+### 3. Or Connect to Claude Desktop (~5 minutes)
+
+Open the configuration file following the [MCP local server connection guide](https://modelcontextprotocol.io/docs/2026-07-28/develop/connect-local-servers):
+
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Claude Desktop requires absolute paths (replace `D:\\projects\\backend-ai-assistant` with your actual project path):
+
+```json
+{
+  "mcpServers": {
+    "backend-support": {
+      "command": "D:\\projects\\backend-ai-assistant\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\projects\\backend-ai-assistant\\mcp_server\\server.py"]
+    }
+  }
+}
+```
+
+Fully quit Claude Desktop (including from the Windows System Tray) and reopen it. If the server does not appear, check `stderr` logs immediately with PowerShell:
+
+```powershell
+type "$env:AppData\Claude\logs\mcp*.log"
+```
+
+### 4. Run 3 Real-World Test Scenarios and Commit to GitHub (~10 minutes)
+
+Open Agent mode in Cursor (or a chat in Claude Desktop) and run these 3 checks in order:
+
+1. **Chained 2-tool call (Happy path):** Ask *"Check the status of order ORD-1001 and see if there are any open high-priority support tickets."*
+2. **Invalid input validation (Edge case):** Ask *"Look up order code ABC-999 for me."* → confirm the tool does not crash and returns a clear `invalid_input` error.
+3. **Log verification:** Open the **Output / MCP Logs** panel in Cursor (or the Claude Desktop log file) to verify that logs display timestamps, tool names, parameters, and execution time in milliseconds (`ms`).
+
+Finally, commit and push your production-ready MCP Server to GitHub:
+
+```bash
+git add mcp_server/server.py .cursor/mcp.json
+git commit -m "feat(mcp): add Pydantic validation, stderr logging, and Cursor MCP config"
+git push origin main
+```

@@ -311,3 +311,234 @@ git push origin main
 ```
 
 > **Lưu ý khi chạy MCP Server qua `stdio`:** Không sử dụng lệnh `print()` để debug bên trong `server.py`, vì luồng `stdout` được dùng để truyền các gói tin JSON-RPC của giao thức MCP. Nếu cần ghi log gỡ lỗi, hãy sử dụng module `logging` của Python cấu hình xuất ra `sys.stderr` (chúng ta sẽ hoàn thiện phần này ở tác vụ Ngày 3).
+
+---
+
+## C. Nâng cấp MCP Server với Pydantic, Logging ra `stderr` và kết nối vào Cursor / Claude Desktop (Ngày 3: 25/11/2026)
+
+Để hoàn thành tác vụ Ngày 3 (Thứ 4, 25/11), bạn sẽ nâng cấp `mcp_server/server.py` lên chuẩn production hơn (chặn dữ liệu sai bằng Pydantic, bắt lỗi DB, ghi log sạch ra `stderr`), sau đó kết nối trực tiếp vào Cursor hoặc Claude Desktop để kiểm thử với LLM thật.
+
+### 1. Nâng cấp `mcp_server/server.py` với Pydantic và Logging ra `stderr` (~20 phút)
+
+`fastmcp` đã cài sẵn `pydantic`. Bạn cập nhật lại `mcp_server/server.py` để:
+
+- Ghi toàn bộ log vào `sys.stderr` (tránh làm hỏng luồng JSON-RPC trên `stdout`).
+- Dùng `Literal`, `Field` và validator của Pydantic để ép LLM truyền đúng định dạng `order_code`, `status`, `priority` và `limit`.
+- Bọc `try/except (sqlite3.Error, FileNotFoundError)` và ghi nhận thời gian thực thi (`ms`) của mỗi lần gọi tool.
+
+```python
+import logging
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any, Literal
+from fastmcp import FastMCP
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# 1. Cấu hình logging xuất ra stderr (tuyệt đối không dùng stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("backend-support-mcp")
+
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+mcp = FastMCP("BackendSupportMCP")
+
+
+# 2. Schema validate đầu vào bằng Pydantic
+class OrderLookupInput(BaseModel):
+    order_code: str = Field(..., min_length=4, max_length=20, description="Mã đơn hàng dạng ORD-1001")
+
+    @field_validator("order_code")
+    @classmethod
+    def normalize_code(cls, v: str) -> str:
+        code = v.strip().upper()
+        if not code.startswith("ORD-"):
+            raise ValueError("Mã đơn hàng phải bắt đầu bằng 'ORD-' (ví dụ: ORD-1001).")
+        return code
+
+
+class TicketFilterInput(BaseModel):
+    status: Literal["open", "in_progress", "resolved"] | None = None
+    priority: Literal["low", "medium", "high"] | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+def get_connection() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Không tìm thấy file database tại {DB_PATH}")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@mcp.resource("db://schema")
+def get_database_schema() -> str:
+    """Trả về cấu trúc các bảng hiện có trong cơ sở dữ liệu."""
+    logger.info("Resource requested: db://schema")
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    return "\n\n".join(f"-- Table: {row['name']}\n{row['sql']}" for row in rows)
+
+
+@mcp.tool()
+def get_order_by_code(order_code: str) -> dict[str, Any]:
+    """Tra cứu chi tiết một đơn hàng theo mã order_code (ví dụ: ORD-1001), kèm thông tin khách hàng."""
+    start = time.perf_counter()
+    try:
+        validated = OrderLookupInput(order_code=order_code)
+        logger.info("Tool call: get_order_by_code(order_code=%s)", validated.order_code)
+
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT o.order_code, o.product_name, o.total_amount, o.status, o.updated_at,
+                       c.full_name AS customer_name, c.email AS customer_email, c.tier AS customer_tier
+                FROM orders o
+                JOIN customers c ON o.customer_id = c.id
+                WHERE o.order_code = ?
+                """,
+                (validated.order_code,),
+            ).fetchone()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if not row:
+            logger.info("Order %s not found (%.1fms)", validated.order_code, elapsed_ms)
+            return {"found": False, "message": f"Không tìm thấy đơn hàng '{validated.order_code}'."}
+
+        logger.info("Order %s fetched successfully (%.1fms)", validated.order_code, elapsed_ms)
+        return {"found": True, "order": dict(row)}
+
+    except ValidationError as e:
+        logger.warning("Validation error in get_order_by_code: %s", e)
+        return {"found": False, "error": "invalid_input", "details": e.errors()[0]["msg"]}
+    except (sqlite3.Error, FileNotFoundError) as e:
+        logger.exception("Database error in get_order_by_code")
+        return {"found": False, "error": "database_error", "details": str(e)}
+
+
+@mcp.tool()
+def list_support_tickets(
+    status: Literal["open", "in_progress", "resolved"] | None = None,
+    priority: Literal["low", "medium", "high"] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Lọc danh sách phiếu hỗ trợ (support tickets) theo status, priority và giới hạn số bản ghi."""
+    start = time.perf_counter()
+    try:
+        validated = TicketFilterInput(status=status, priority=priority, limit=limit)
+        logger.info(
+            "Tool call: list_support_tickets(status=%s, priority=%s, limit=%d)",
+            validated.status,
+            validated.priority,
+            validated.limit,
+        )
+
+        query = """
+            SELECT t.id, t.subject, t.priority, t.status, t.created_at,
+                   c.full_name AS customer_name, c.tier AS customer_tier,
+                   o.order_code
+            FROM support_tickets t
+            JOIN customers c ON t.customer_id = c.id
+            LEFT JOIN orders o ON t.order_id = o.id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+
+        if validated.status:
+            query += " AND t.status = ?"
+            params.append(validated.status)
+        if validated.priority:
+            query += " AND t.priority = ?"
+            params.append(validated.priority)
+
+        query += " ORDER BY t.created_at DESC LIMIT ?"
+        params.append(validated.limit)
+
+        with get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info("Fetched %d tickets (%.1fms)", len(rows), elapsed_ms)
+        return {"count": len(rows), "tickets": [dict(row) for row in rows]}
+
+    except ValidationError as e:
+        logger.warning("Validation error in list_support_tickets: %s", e)
+        return {"count": 0, "error": "invalid_input", "details": e.errors()[0]["msg"]}
+    except (sqlite3.Error, FileNotFoundError) as e:
+        logger.exception("Database error in list_support_tickets")
+        return {"count": 0, "error": "database_error", "details": str(e)}
+
+
+if __name__ == "__main__":
+    logger.info("Starting BackendSupportMCP server (DB=%s)", DB_PATH)
+    mcp.run()
+```
+
+### 2. Kết nối MCP Server vào Cursor (khuyên dùng, ~5 phút)
+
+Theo [tài liệu MCP của Cursor](https://cursor.com/docs/mcp), bạn chỉ cần tạo tệp `.cursor/mcp.json` ngay tại thư mục gốc dự án để dùng biến `${workspaceFolder}` (không cần hardcode đường dẫn cá nhân):
+
+**Trên Windows:**
+
+```json
+{
+  "mcpServers": {
+    "backend-support": {
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["${workspaceFolder}/mcp_server/server.py"]
+    }
+  }
+}
+```
+
+**Trên macOS / Linux:** đổi `command` thành `"${workspaceFolder}/.venv/bin/python"`.
+
+Sau đó nhấn `Ctrl+Shift+P` → **Reload Window**, vào **Settings → Tools & MCP** để đảm bảo server `backend-support` hiện chấm xanh và liệt kê đủ 2 tool.
+
+### 3. Hoặc kết nối vào Claude Desktop (~5 phút)
+
+Mở tệp cấu hình theo [hướng dẫn kết nối local server của MCP](https://modelcontextprotocol.io/docs/2026-07-28/develop/connect-local-servers):
+
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Claude Desktop yêu cầu đường dẫn tuyệt đối (thay `D:\\projects\\backend-ai-assistant` bằng đường dẫn thật trên máy bạn):
+
+```json
+{
+  "mcpServers": {
+    "backend-support": {
+      "command": "D:\\projects\\backend-ai-assistant\\.venv\\Scripts\\python.exe",
+      "args": ["D:\\projects\\backend-ai-assistant\\mcp_server\\server.py"]
+    }
+  }
+}
+```
+
+Tắt hẳn Claude Desktop (kể cả dưới khay hệ thống System Tray trên Windows) rồi mở lại. Nếu server không hiện, xem log `stderr` ngay bằng PowerShell:
+
+```powershell
+type "$env:AppData\Claude\logs\mcp*.log"
+```
+
+### 4. Chạy 3 kịch bản test thực tế và commit lên GitHub (~10 phút)
+
+Mở chế độ Agent trong Cursor (hoặc chat trong Claude Desktop) và thử lần lượt 3 kịch bản sau để kiểm chứng:
+
+1. **Test gọi chuỗi 2 tool (Happy path):** *"Kiểm tra giúp tôi đơn hàng ORD-1001 đang ở trạng thái nào và xem có ticket nào đang mở ở mức ưu tiên high không?"*
+2. **Test validate input sai (Edge case):** *"Tra cứu giúp tôi đơn hàng có mã ABC-999"* → xác nhận tool không crash mà trả về lỗi `invalid_input` rõ ràng.
+3. **Test kiểm tra log:** Mở bảng **Output / MCP Logs** trong Cursor (hoặc file log Claude Desktop) để xác nhận log hiển thị đủ timestamp, tên tool, tham số và thời gian xử lý (`ms`).
+
+Cuối cùng push bản hoàn thiện MCP Server lên GitHub:
+
+```bash
+git add mcp_server/server.py .cursor/mcp.json
+git commit -m "feat(mcp): add Pydantic validation, stderr logging, and Cursor MCP config"
+git push origin main
+```
